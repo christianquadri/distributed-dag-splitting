@@ -62,7 +62,7 @@ class DagSplitSolution:
         return list(self._offloaded_srv.keys())
 
     def __repr__(self):
-        return f'Local ({self._decision_node}: {self._local_computed_srv}\n{self._offloaded_srv}'
+        return f'Local ({self._decision_node}): {self._local_computed_srv}\nOffloaded: {self._offloaded_srv}'
 
 
 class FinalDagDeployment:
@@ -76,6 +76,7 @@ class FinalDagDeployment:
 
     def get_deployment(self):
         return copy.deepcopy(self.srv_deployment) # copy for sanity!
+
 
 
 def solve_dag_split_assignment(local_phy_net: nx.Graph,
@@ -92,7 +93,11 @@ def solve_dag_split_assignment(local_phy_net: nx.Graph,
     def full_mesh(): return list(itertools.product(local_phy_net.nodes(), repeat=2))
     def phy_node_agg_cap(u): return local_phy_net.nodes()[u][PHY_NODE_AGG_CAP]
 
-    model = gp.Model(name="split_assign")
+    env = gp.Env(empty=True)
+    env.setParam('OutputFlag', 0)
+    env.start()
+
+    model = gp.Model(name="split_assign",env=env)
 
     x = model.addVars(srv_dag.nodes(), local_phy_net.nodes(), vtype=GRB.BINARY, name="x")
     e = model.addVars(local_phy_net.edges(), vtype=GRB.CONTINUOUS, name='e')
@@ -115,10 +120,18 @@ def solve_dag_split_assignment(local_phy_net: nx.Graph,
         (x[i, u] * x[j, v] <= phy_link_only_constr(u, v) for i, j in srv_links() for u, v in full_mesh()),
         name='phy_link_only')
 
+    #link_used_cap = model.addConstrs( (1/phy_link_cap(u,v) * gp.quicksum((srv_link_tx(i,j)*x[i,u]*x[j,v] for i,j in srv_links())) == e[u,v]  for u,v in phy_links()), name='used_edge_perc' )
+    #node_used_cap = model.addConstrs( (1/phy_node_cap(u) * gp.quicksum(srv_node_cpu(i)* x[i,u] for i in srv_dag.nodes()) == n[u]  for u in local_phy_net.nodes()), name='used_node_perc' )
+
+
+    #model.setObjective(gp.quicksum(e[u,v] for u,v in phy_links() ) + gp.quicksum(n[u]  for u in local_phy_net.nodes()), GRB.MINIMIZE)
+
+
     model.setObjective(gp.quicksum(gp.quicksum(x[i, u] for i in srv_dag.nodes()) * phy_node_agg_cap(u) for u in local_phy_net.nodes()), GRB.MINIMIZE)
 
     model.optimize()
 
+    #pprint(x)
     # process model solution
     return DagSplitSolution(x, decision_node)
 
@@ -131,8 +144,10 @@ def deploy_service_request(phy_net: nx.DiGraph, srv_req: ServiceRequest) -> Fina
 
     def get_local_phy_net(phy_node:int,
                           forbidden_neighbors: Iterable[int]) -> nx.Graph:
-        allowed_neighbors = set(phy_net.neighbors(phy_node)).difference(forbidden_neighbors)
-        return phy_net.subgraph(allowed_neighbors)
+        allowed_neighbors = set(phy_net.neighbors(phy_node)).difference(forbidden_neighbors).union([phy_node])
+        #allowed_neighbors.add(phy_node)
+        local_sub_graph = phy_net.subgraph(allowed_neighbors)
+        return local_sub_graph
 
     # Breadth-first search
     final_deployment = FinalDagDeployment(srv_req=srv_req)
@@ -148,7 +163,7 @@ def deploy_service_request(phy_net: nx.DiGraph, srv_req: ServiceRequest) -> Fina
                                               srv_dag=request.service_dag,
                                               decision_node=request.request_node)
 
-        print(solution)
+        #pprint(solution)
 
         # update the final deployment accounting for the service/s that has been selected
         # to be processed on the local node
@@ -165,36 +180,65 @@ def deploy_service_request(phy_net: nx.DiGraph, srv_req: ServiceRequest) -> Fina
     return final_deployment
 
 
+def calculate_agg_capacity(G):
+    for i in range(10):
+        for node_id in G.nodes():
+            node = G.nodes()[node_id]
+            neighbors = list(G.neighbors(node_id))
+            if not neighbors:
+                continue
+
+            sum_rates = 0
+
+            for neighbor_id in neighbors:
+                neighbor = G.nodes()[neighbor_id]
+                datarate = G.edges[node_id, neighbor_id][PHY_LINK_DATARATE]
+                delay = (1 / datarate)
+
+                sum_rates += (1 / (delay + 1 / neighbor[PHY_NODE_AGG_CAP]))
+
+            node[PHY_NODE_AGG_CAP] = node[PHY_NODE_CAP] + sum_rates
+
 
 
 if __name__ == '__main__':
     physical_net = nx.DiGraph()
-    physical_net.add_node(1,capacity=300, agg_capacity=300)
-    physical_net.add_node(2, capacity=100, agg_capacity=200)
+    physical_net.add_node(1,capacity=200, agg_capacity=300)
+    physical_net.add_node(2, capacity=200, agg_capacity=200)
     physical_net.add_node(3, capacity=200, agg_capacity=240)
     physical_net.add_node(4, capacity=200, agg_capacity=200)
     physical_net.add_node(5, capacity=200, agg_capacity=200)
     physical_net.add_node(6, capacity=200, agg_capacity=200)
-    physical_net.add_edge(1,2, datarate=100)
-    physical_net.add_edge(2, 1, datarate=100)
+    physical_net.add_edge(1,2, datarate=50)
+    physical_net.add_edge(2, 1, datarate=50)
 
-    physical_net.add_edge(2, 5, datarate=100)
-    physical_net.add_edge(5, 2, datarate=100)
+    #physical_net.add_edge(2, 5, datarate=50)
+    #physical_net.add_edge(5, 2, datarate=50)
 
-    physical_net.add_edge(1, 5, datarate=100)
-    physical_net.add_edge(5, 1, datarate=100)
+    physical_net.add_edge(1, 5, datarate=50)
+    physical_net.add_edge(5, 1, datarate=50)
 
-    physical_net.add_edge(2, 3, datarate=20)
-    physical_net.add_edge(3, 2, datarate=20)
+    physical_net.add_edge(2, 3, datarate=40)
+    physical_net.add_edge(3, 2, datarate=40)
 
-    physical_net.add_edge(5, 6, datarate=20)
-    physical_net.add_edge(6, 5, datarate=20)
+    physical_net.add_edge(5, 6, datarate=40)
+    physical_net.add_edge(6, 5, datarate=40)
 
-    physical_net.add_edge(3, 6, datarate=20)
-    physical_net.add_edge(6, 3, datarate=20)
+    physical_net.add_edge(3, 6, datarate=50)
+    physical_net.add_edge(6, 3, datarate=50)
 
-    physical_net.add_edge(3, 4, datarate=20)
-    physical_net.add_edge(4, 3, datarate=20)
+    physical_net.add_edge(3, 4, datarate=40)
+    physical_net.add_edge(4, 3, datarate=40)
+
+    #for node_id in physical_net.nodes():
+    #    print(physical_net.nodes()[node_id])
+
+    calculate_agg_capacity(physical_net)
+
+    for node_id in physical_net.nodes():
+        print(node_id, physical_net.nodes()[node_id])
+
+
 
 
     service = nx.DiGraph()
@@ -208,6 +252,8 @@ if __name__ == '__main__':
     service.add_edge('A', 'C', tx=10)
     service.add_edge('B', 'E', tx=10)
     service.add_edge('C', 'D', tx=20)
-    #service.add_edge('D', 'E', tx=5)
+    service.add_edge('D', 'E', tx=5)
 
-    deploy_service_request(physical_net, ServiceRequest(service,1))
+    # Service 1
+    deployment = deploy_service_request(physical_net, ServiceRequest(service,1))
+    pprint(deployment.get_deployment())
